@@ -100,17 +100,11 @@ typedef int mode_t;
 #else
 #include <pthread.h>
 #include <sys/resource.h>  // getrlimit, setrlimit
-#include <unistd.h>  // setuid, getuid
-#endif
-
-#if defined(__POSIX__) && !defined(__ANDROID__) && !defined(__CloudABI__)
-#include <pwd.h>  // getpwnam()
-#include <grp.h>  // getgrnam()
+#include <unistd.h>        // STDIN_FILENO, STDERR_FILENO
 #endif
 
 namespace node {
 
-using native_module::NativeModuleLoader;
 using options_parser::kAllowedInEnvironment;
 using options_parser::kDisallowedInEnvironment;
 using v8::Array;
@@ -132,7 +126,6 @@ using v8::Maybe;
 using v8::MaybeLocal;
 using v8::Message;
 using v8::MicrotasksPolicy;
-using v8::NamedPropertyHandlerConfiguration;
 using v8::NewStringType;
 using v8::None;
 using v8::Nothing;
@@ -155,15 +148,12 @@ unsigned int reverted = 0;
 
 bool v8_initialized = false;
 
-bool linux_at_secure = false;
-
 // process-relative uptime base, initialized at start-up
 double prog_start_time;
 
 Mutex per_process_opts_mutex;
 std::shared_ptr<PerProcessOptions> per_process_opts {
     new PerProcessOptions() };
-NativeModuleLoader per_process_loader;
 static Mutex node_isolate_mutex;
 static Isolate* node_isolate;
 
@@ -503,27 +493,6 @@ const char* signo_string(int signo) {
   default: return "";
   }
 }
-
-// Look up environment variable unless running as setuid root.
-bool SafeGetenv(const char* key, std::string* text) {
-#if !defined(__CloudABI__) && !defined(_WIN32)
-  if (linux_at_secure || getuid() != geteuid() || getgid() != getegid())
-    goto fail;
-#endif
-
-  {
-    Mutex::ScopedLock lock(environ_mutex);
-    if (const char* value = getenv(key)) {
-      *text = value;
-      return true;
-    }
-  }
-
-fail:
-  text->clear();
-  return false;
-}
-
 
 void* ArrayBufferAllocator::Allocate(size_t size) {
   if (zero_fill_field_ || per_process_opts->zero_fill_all_buffers)
@@ -908,7 +877,10 @@ void SetupProcessObject(Environment* env,
   READONLY_PROPERTY(process, "versions", versions);
 
 #define V(key)                                                                 \
-  READONLY_STRING_PROPERTY(versions, #key, per_process::metadata.versions.key);
+  if (!per_process::metadata.versions.key.empty()) {                           \
+    READONLY_STRING_PROPERTY(                                                  \
+        versions, #key, per_process::metadata.versions.key);                   \
+  }
   NODE_VERSIONS_KEYS(V)
 #undef V
 
@@ -987,21 +959,11 @@ void SetupProcessObject(Environment* env,
                exec_arguments).FromJust();
 
   // create process.env
-  Local<ObjectTemplate> process_env_template =
-      ObjectTemplate::New(env->isolate());
-  process_env_template->SetHandler(NamedPropertyHandlerConfiguration(
-          EnvGetter,
-          EnvSetter,
-          EnvQuery,
-          EnvDeleter,
-          EnvEnumerator,
-          env->as_external()));
-
-  Local<Object> process_env =
-      process_env_template->NewInstance(env->context()).ToLocalChecked();
-  process->Set(env->context(),
-               FIXED_ONE_BYTE_STRING(env->isolate(), "env"),
-               process_env).FromJust();
+  process
+      ->Set(env->context(),
+            FIXED_ONE_BYTE_STRING(env->isolate(), "env"),
+            CreateEnvVarProxy(context, isolate, env->as_external()))
+      .FromJust();
 
   READONLY_PROPERTY(process, "pid",
                     Integer::New(env->isolate(), uv_os_getpid()));
@@ -1124,22 +1086,23 @@ void SetupProcessObject(Environment* env,
   SECURITY_REVERSIONS(V)
 #undef V
 
-  size_t exec_path_len = 2 * PATH_MAX;
-  char* exec_path = new char[exec_path_len];
-  Local<String> exec_path_value;
-  if (uv_exepath(exec_path, &exec_path_len) == 0) {
-    exec_path_value = String::NewFromUtf8(env->isolate(),
-                                          exec_path,
-                                          NewStringType::kInternalized,
-                                          exec_path_len).ToLocalChecked();
-  } else {
-    exec_path_value = String::NewFromUtf8(env->isolate(), args[0].c_str(),
-        NewStringType::kInternalized).ToLocalChecked();
+  {
+    size_t exec_path_len = 2 * PATH_MAX;
+    std::vector<char> exec_path(exec_path_len);
+    Local<String> exec_path_value;
+    if (uv_exepath(exec_path.data(), &exec_path_len) == 0) {
+      exec_path_value = String::NewFromUtf8(env->isolate(),
+                                            exec_path.data(),
+                                            NewStringType::kInternalized,
+                                            exec_path_len).ToLocalChecked();
+    } else {
+      exec_path_value = String::NewFromUtf8(env->isolate(), args[0].c_str(),
+          NewStringType::kInternalized).ToLocalChecked();
+    }
+    process->Set(env->context(),
+                 FIXED_ONE_BYTE_STRING(env->isolate(), "execPath"),
+                 exec_path_value).FromJust();
   }
-  process->Set(env->context(),
-               FIXED_ONE_BYTE_STRING(env->isolate(), "execPath"),
-               exec_path_value).FromJust();
-  delete[] exec_path;
 
   auto debug_port_string = FIXED_ONE_BYTE_STRING(env->isolate(), "debugPort");
   CHECK(process->SetAccessor(env->context(),
@@ -1170,14 +1133,6 @@ void SetupProcessObject(Environment* env,
   env->SetMethod(process, "dlopen", binding::DLOpen);
   env->SetMethod(process, "reallyExit", Exit);
   env->SetMethodNoSideEffect(process, "uptime", Uptime);
-
-#if defined(__POSIX__) && !defined(__ANDROID__) && !defined(__CloudABI__)
-  env->SetMethodNoSideEffect(process, "getuid", GetUid);
-  env->SetMethodNoSideEffect(process, "geteuid", GetEUid);
-  env->SetMethodNoSideEffect(process, "getgid", GetGid);
-  env->SetMethodNoSideEffect(process, "getegid", GetEGid);
-  env->SetMethodNoSideEffect(process, "getgroups", GetGroups);
-#endif  // __POSIX__ && !defined(__ANDROID__) && !defined(__CloudABI__)
 }
 
 
@@ -1198,7 +1153,7 @@ static MaybeLocal<Value> ExecuteBootstrapper(
     const char* id,
     std::vector<Local<String>>* parameters,
     std::vector<Local<Value>>* arguments) {
-  MaybeLocal<Value> ret = per_process_loader.CompileAndCall(
+  MaybeLocal<Value> ret = per_process::native_module_loader.CompileAndCall(
       env->context(), id, parameters, arguments, env);
 
   // If there was an error during bootstrap then it was either handled by the
@@ -1638,37 +1593,40 @@ void Init(std::vector<std::string>* argv,
   {
     std::string text;
     default_env_options->pending_deprecation =
-        SafeGetenv("NODE_PENDING_DEPRECATION", &text) && text[0] == '1';
+        credentials::SafeGetenv("NODE_PENDING_DEPRECATION", &text) &&
+        text[0] == '1';
   }
 
   // Allow for environment set preserving symlinks.
   {
     std::string text;
     default_env_options->preserve_symlinks =
-        SafeGetenv("NODE_PRESERVE_SYMLINKS", &text) && text[0] == '1';
+        credentials::SafeGetenv("NODE_PRESERVE_SYMLINKS", &text) &&
+        text[0] == '1';
   }
 
   {
     std::string text;
     default_env_options->preserve_symlinks_main =
-        SafeGetenv("NODE_PRESERVE_SYMLINKS_MAIN", &text) && text[0] == '1';
+        credentials::SafeGetenv("NODE_PRESERVE_SYMLINKS_MAIN", &text) &&
+        text[0] == '1';
   }
 
   if (default_env_options->redirect_warnings.empty()) {
-    SafeGetenv("NODE_REDIRECT_WARNINGS",
-               &default_env_options->redirect_warnings);
+    credentials::SafeGetenv("NODE_REDIRECT_WARNINGS",
+                            &default_env_options->redirect_warnings);
   }
 
 #if HAVE_OPENSSL
   std::string* openssl_config = &per_process_opts->openssl_config;
   if (openssl_config->empty()) {
-    SafeGetenv("OPENSSL_CONF", openssl_config);
+    credentials::SafeGetenv("OPENSSL_CONF", openssl_config);
   }
 #endif
 
 #if !defined(NODE_WITHOUT_NODE_OPTIONS)
   std::string node_options;
-  if (SafeGetenv("NODE_OPTIONS", &node_options)) {
+  if (credentials::SafeGetenv("NODE_OPTIONS", &node_options)) {
     std::vector<std::string> env_argv;
     // [0] is expected to be the program name, fill it in from the real argv.
     env_argv.push_back(argv->at(0));
@@ -1700,7 +1658,7 @@ void Init(std::vector<std::string>* argv,
 #if defined(NODE_HAVE_I18N_SUPPORT)
   // If the parameter isn't given, use the env variable.
   if (per_process_opts->icu_data_dir.empty())
-    SafeGetenv("NODE_ICU_DATA", &per_process_opts->icu_data_dir);
+    credentials::SafeGetenv("NODE_ICU_DATA", &per_process_opts->icu_data_dir);
   // Initialize ICU.
   // If icu_data_dir is empty here, it will load the 'minimal' data.
   if (!i18n::InitializeICUDirectory(per_process_opts->icu_data_dir)) {
@@ -1710,6 +1668,7 @@ void Init(std::vector<std::string>* argv,
             argv->at(0).c_str());
     exit(9);
   }
+  per_process::metadata.versions.InitializeIntlVersions();
 #endif
 
   // We should set node_is_initialized here instead of in node::Start,
@@ -1917,7 +1876,7 @@ Local<Context> NewContext(Isolate* isolate,
     std::vector<Local<String>> parameters = {
         FIXED_ONE_BYTE_STRING(isolate, "global")};
     std::vector<Local<Value>> arguments = {context->Global()};
-    MaybeLocal<Value> result = per_process_loader.CompileAndCall(
+    MaybeLocal<Value> result = per_process::native_module_loader.CompileAndCall(
         context, "internal/per_context", &parameters, &arguments, nullptr);
     if (result.IsEmpty()) {
       // Execution failed during context creation.
@@ -2108,7 +2067,7 @@ int Start(int argc, char** argv) {
 #if HAVE_OPENSSL
   {
     std::string extra_ca_certs;
-    if (SafeGetenv("NODE_EXTRA_CA_CERTS", &extra_ca_certs))
+    if (credentials::SafeGetenv("NODE_EXTRA_CA_CERTS", &extra_ca_certs))
       crypto::UseExtraCaCerts(extra_ca_certs);
   }
 #ifdef NODE_FIPS_MODE

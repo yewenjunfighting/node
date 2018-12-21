@@ -2,21 +2,63 @@
 #include "ares.h"
 #include "nghttp2/nghttp2ver.h"
 #include "node.h"
-#include "node_internals.h"
 #include "util.h"
 #include "uv.h"
 #include "v8.h"
 #include "zlib.h"
 
 #if HAVE_OPENSSL
-#include "node_crypto.h"
-#endif
+#include <openssl/opensslv.h>
+#endif  // HAVE_OPENSSL
+
+#ifdef NODE_HAVE_I18N_SUPPORT
+#include <unicode/timezone.h>
+#include <unicode/ulocdata.h>
+#include <unicode/uvernum.h>
+#include <unicode/uversion.h>
+#endif  // NODE_HAVE_I18N_SUPPORT
 
 namespace node {
 
 namespace per_process {
 Metadata metadata;
 }
+
+#if HAVE_OPENSSL
+constexpr int search(const char* s, int n, int c) {
+  return *s == c ? n : search(s + 1, n + 1, c);
+}
+
+std::string GetOpenSSLVersion() {
+  // sample openssl version string format
+  // for reference: "OpenSSL 1.1.0i 14 Aug 2018"
+  char buf[128];
+  const int start = search(OPENSSL_VERSION_TEXT, 0, ' ') + 1;
+  const int end = search(OPENSSL_VERSION_TEXT + start, start, ' ');
+  const int len = end - start;
+  snprintf(buf, sizeof(buf), "%.*s", len, &OPENSSL_VERSION_TEXT[start]);
+  return std::string(buf);
+}
+#endif  // HAVE_OPENSSL
+
+#ifdef NODE_HAVE_I18N_SUPPORT
+void Metadata::Versions::InitializeIntlVersions() {
+  UErrorCode status = U_ZERO_ERROR;
+
+  const char* tz_version = icu::TimeZone::getTZDataVersion(status);
+  if (U_SUCCESS(status)) {
+    tz = tz_version;
+  }
+
+  char buf[U_MAX_VERSION_STRING_LENGTH];
+  UVersionInfo versionArray;
+  ulocdata_getCLDRVersion(versionArray, &status);
+  if (U_SUCCESS(status)) {
+    u_versionToString(versionArray, buf);
+    cldr = buf;
+  }
+}
+#endif  // NODE_HAVE_I18N_SUPPORT
 
 Metadata::Versions::Versions() {
   node = NODE_VERSION_STRING;
@@ -27,12 +69,17 @@ Metadata::Versions::Versions() {
   modules = NODE_STRINGIFY(NODE_MODULE_VERSION);
   nghttp2 = NGHTTP2_VERSION;
   napi = NODE_STRINGIFY(NAPI_VERSION);
-  llhttp = llhttp_version;
-  http_parser = http_parser_version;
+  llhttp = per_process::llhttp_version;
+  http_parser = per_process::http_parser_version;
 
 #if HAVE_OPENSSL
-  openssl = crypto::GetOpenSSLVersion();
+  openssl = GetOpenSSLVersion();
 #endif
+
+#ifdef NODE_HAVE_I18N_SUPPORT
+  icu = U_ICU_VERSION;
+  unicode = U_UNICODE_VERSION;
+#endif  // NODE_HAVE_I18N_SUPPORT
 }
 
 }  // namespace node

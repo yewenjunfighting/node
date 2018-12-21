@@ -211,6 +211,14 @@ Environment::Environment(IsolateData* isolate_data,
   }
 
   destroy_async_id_list_.reserve(512);
+  BeforeExit(
+      [](void* arg) {
+        Environment* env = static_cast<Environment*>(arg);
+        if (!env->destroy_async_id_list()->empty())
+          AsyncWrap::DestroyAsyncIdsCallback(env, nullptr);
+      },
+      this);
+
   performance_state_.reset(new performance::performance_state(isolate()));
   performance_state_->Mark(
       performance::NODE_PERFORMANCE_MILESTONE_ENVIRONMENT);
@@ -225,7 +233,7 @@ Environment::Environment(IsolateData* isolate_data,
   should_abort_on_uncaught_toggle_[0] = 1;
 
   std::string debug_cats;
-  SafeGetenv("NODE_DEBUG_NATIVE", &debug_cats);
+  credentials::SafeGetenv("NODE_DEBUG_NATIVE", &debug_cats);
   set_debug_categories(debug_cats, true);
 
   isolate()->GetHeapProfiler()->AddBuildEmbedderGraphCallback(
@@ -268,6 +276,11 @@ Environment::~Environment() {
 
   TRACE_EVENT_NESTABLE_ASYNC_END0(
     TRACING_CATEGORY_NODE1(environment), "Environment", this);
+
+  // Dereference all addons that were loaded into this environment.
+  for (binding::DLib& addon : loaded_addons_) {
+    addon.Close();
+  }
 }
 
 void Environment::Start(const std::vector<std::string>& args,

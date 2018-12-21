@@ -518,6 +518,12 @@ void SecureContext::Init(const FunctionCallbackInfo<Value>& args) {
                                  SSL_SESS_CACHE_NO_AUTO_CLEAR);
 
   SSL_CTX_set_min_proto_version(sc->ctx_.get(), min_version);
+
+  if (max_version == 0) {
+    // Selecting some secureProtocol methods allows the TLS version to be "any
+    // supported", but we don't support TLSv1.3, even if OpenSSL does.
+    max_version = TLS1_2_VERSION;
+  }
   SSL_CTX_set_max_proto_version(sc->ctx_.get(), max_version);
 
   // OpenSSL 1.1.0 changed the ticket key size, but the OpenSSL 1.0.x size was
@@ -5834,21 +5840,6 @@ void Initialize(Local<Object> target,
 #ifndef OPENSSL_NO_SCRYPT
   env->SetMethod(target, "scrypt", Scrypt);
 #endif  // OPENSSL_NO_SCRYPT
-}
-
-constexpr int search(const char* s, int n, int c) {
-  return *s == c ? n : search(s + 1, n + 1, c);
-}
-
-std::string GetOpenSSLVersion() {
-  // sample openssl version string format
-  // for reference: "OpenSSL 1.1.0i 14 Aug 2018"
-  char buf[128];
-  const int start = search(OPENSSL_VERSION_TEXT, 0, ' ') + 1;
-  const int end = search(OPENSSL_VERSION_TEXT + start, start, ' ');
-  const int len = end - start;
-  snprintf(buf, sizeof(buf), "%.*s", len, &OPENSSL_VERSION_TEXT[start]);
-  return std::string(buf);
 }
 
 }  // namespace crypto
